@@ -8,6 +8,14 @@ Les blocs apparaissent comme **occupé** → personne ne peut booker par-dessus 
 
 ## Comment ça marche
 
+### Architecture
+
+| Trigger | Fréquence | Portée | Rôle |
+|---|---|---|---|
+| `onCalChange_` | ~30sec après chaque modif | **Seulement les jours modifiés** | Détecte via sync token quels events ont changé. Traite uniquement ces journées. Fonctionne même pour un meeting dans 3 semaines. |
+| `scanUpcoming_` | Toutes les 30min (configurable) | **7 prochains jours** | Filet de sécurité. Rattrape ce que le hook a manqué. |
+| `morningSweep_` | 1x/jour à 7h | **Aujourd'hui** | Vérifie les conflits non résolus, envoie un email si problème. |
+
 ### Logique principale
 
 Pour chaque réunion physique de la journée (triées par heure) :
@@ -92,7 +100,7 @@ Si un événement dans ton calendrier commence le soir et se termine le lendemai
 | `BUFFER_MINUTES` | `10` | Buffer ajouté au trajet (minutes) |
 | `WATCH_CALENDAR_ID` | `primary` | Calendrier à surveiller |
 | `GOOGLE_MAPS_API_KEY` | `AIza...` | **Ta clé API Maps** (étape 1) |
-| `SCAN_LOOKAHEAD_HOURS` | `48` | Fenêtre de scan (heures) |
+| `POLL_INTERVAL_MINUTES` | `30` | Fréquence du poll de sécurité (minutes) |
 | `DAY_START_HOUR` | `9` | Début de journée (format 24h) |
 | `FIRST_MEETING_WINDOW` | `90` | 1er meeting dans ce délai → départ maison (min) |
 | `CHAIN_WINDOW_MINUTES` | `120` | Fenêtre de chaînage depuis le meeting précédent (min) |
@@ -114,9 +122,10 @@ Si un événement dans ton calendrier commence le soir et se termine le lendemai
 1. Sélectionne `setup` → **Run**
 2. Vérifie (icône horloge) :
    - `onCalChange_` → Calendar event updated
-   - `scanUpcoming_` → toutes les 5 min
-   - `scanUpcoming_` → toutes les heures
+   - `scanUpcoming_` → toutes les 30 min
    - `morningSweep_` → tous les jours à 7h
+
+> Note : au premier lancement, le sync token s'initialise. Les travel blocks se créeront à partir de la **deuxième** modification de calendrier.
 
 ---
 
@@ -124,7 +133,8 @@ Si un événement dans ton calendrier commence le soir et se termine le lendemai
 
 | Test | Action | Résultat attendu |
 |---|---|---|
-| Trajet simple | Crée un meeting avec une adresse, lance `scanNow` | Bloc `Travel 🚲 Xmin` avant le meeting |
+| Trajet simple | Crée un meeting avec une adresse, attends ~30sec | Bloc `Travel 🚲 Xmin` avant le meeting |
+| Meeting lointain | Crée un meeting dans 2-3 semaines | Travel block créé en ~30sec via `onCalChange_` |
 | Chaînage | 2 meetings dans des lieux différents, <2h d'écart | 1er trajet depuis maison, 2ème depuis le lieu du 1er |
 | Retour intra-journée | 2 meetings avec >2h de gap | Bloc retour après le 1er meeting |
 | Retour fin de journée | 1 seul meeting physique | Bloc retour après le meeting |
@@ -140,7 +150,7 @@ Si un événement dans ton calendrier commence le soir et se termine le lendemai
 |---|---|
 | `authKickstart()` | Approuver les permissions (1 fois) |
 | `setup()` | Installer les triggers (1 fois) |
-| `scanNow()` | Test manuel — scanne les événements |
+| `scanNow()` | Test manuel — scanne les 7 prochains jours |
 | `sweepNow()` | Test manuel — simule le sweep du matin |
 
 ---
@@ -149,18 +159,10 @@ Si un événement dans ton calendrier commence le soir et se termine le lendemai
 
 ### Adapter le mode de transport
 
-Le script utilise le vélo par défaut dans Paris. Pour changer :
-
-- **Bounding box Paris** : modifie `PARIS_BOUNDS` dans le code si tu es dans une autre ville cyclable
+- **Bounding box** : modifie `PARIS_BOUNDS` dans le code pour ta ville
 - **Seuil vélo** : ajuste `CYCLING_MAX_MINUTES` (défaut 45min)
 - **Transit uniquement** : mets `CYCLING_MAX_MINUTES` à `0`
 - **Vélo uniquement** : mets `CYCLING_MAX_MINUTES` à `999`
-
-### Adapter à une autre ville
-
-1. Change `HOME_ADDRESS` / `OFFICE_ADDRESS` dans les Script Properties
-2. Modifie `PARIS_BOUNDS` dans le code pour les limites de ta ville (lat/lng bounding box)
-3. Ou mets `CYCLING_MAX_MINUTES` à `0` pour forcer le transit partout
 
 ### Couleurs Google Calendar
 
@@ -205,11 +207,13 @@ La description contient : origine → destination, mode, lien Google Maps cliqua
 
 | Problème | Solution |
 |---|---|
-| `onEventUpdated` échoue au setup | Relance `setup()` 2-3 fois. C'est intermittent côté Google. Le polling 5min prend le relai. |
-| Duplicatas de travel blocks | V3 corrige ça avec un `LockService`. Lance `scanNow()` pour nettoyer les orphelins. |
+| `onEventUpdated` échoue au setup | Relance `setup()` 2-3 fois. Intermittent côté Google. Le polling 30min prend le relai. |
+| Duplicatas de travel blocks | Corrigé avec `LockService` + `privateExtendedProperty` filter. Lance `scanNow()` pour nettoyer. |
 | Pas de bloc créé | Vérifie : adresse physique dans le champ location, meeting accepté, destination ≠ maison. Passe en `DEBUG`. |
-| Mauvais mode transport | Vélo uniquement si les 2 points sont dans la bounding box Paris ET ≤ 45min. |
+| Pas de bloc au 1er lancement | Normal : le sync token s'initialise. Les blocs se créent à partir de la 2ème modif. Lance `scanNow()` pour forcer. |
+| Mauvais mode transport | Vélo uniquement si les 2 points sont dans la bounding box ET ≤ 45min. |
 | Working location ignoré | Nécessite Google Workspace. Sur Gmail personnel → toujours maison. |
+| Synchro plus lente sur mobile | Normal : Google Calendar sur mobile synchronise moins fréquemment que sur desktop. |
 
 ---
 
@@ -217,4 +221,4 @@ La description contient : origine → destination, mode, lien Google Maps cliqua
 
 Google Apps Script · Calendar API (Advanced) · Directions API · Geocoding API · CacheService · LockService
 
-Basé sur [Auto Drive-Time Blocker](https://github.com/mathewv/auto-drive-time-blocker) par Mathew Varghese (MIT License).
+Basé sur [Auto Drive-Time Blocker](https://github.com/mathewvarghesemanu/drive_to_time_script_for_google_calendar) par Mathew Varghese (MIT License).

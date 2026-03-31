@@ -18,7 +18,8 @@
  *   BUFFER_MINUTES         -> "10"
  *   WATCH_CALENDAR_ID      -> "primary"
  *   GOOGLE_MAPS_API_KEY    -> Directions API key
- *   SCAN_LOOKAHEAD_HOURS   -> "48"
+ *   SCAN_LOOKAHEAD_HOURS   -> "730" (default ~1 month)
+ *   POLL_INTERVAL_MINUTES  -> "30" (fallback polling frequency; onCalChange_ handles real-time)
  *   DAY_START_HOUR         -> "9"
  *   FIRST_MEETING_WINDOW   -> "90"
  *   CHAIN_WINDOW_MINUTES   -> "120"
@@ -228,54 +229,182 @@ function setup() {
     logW('setup: onEventUpdated failed, polling only', { error: e.message });
   }
 
-  ScriptApp.newTrigger('scanUpcoming_').timeBased().everyMinutes(5).create();
-  ScriptApp.newTrigger('scanUpcoming_').timeBased().everyHours(1).create();
+  const pollMinutes = getNumProp_('POLL_INTERVAL_MINUTES', 30);
+  ScriptApp.newTrigger('scanUpcoming_').timeBased().everyMinutes(pollMinutes).create();
   ScriptApp.newTrigger('morningSweep_').timeBased().atHour(7).everyDays(1).create();
-  logI('setup: all triggers installed', { durationMs: durMs_(t0) });
+  logI('setup: all triggers installed', { pollMinutes, durationMs: durMs_(t0) });
 }
 
 // ===================== TRIGGER HANDLERS =====================
 
 function onCalChange_(e) {
   const t0 = Date.now();
-  try { scanUpcoming_(); }
-  catch (err) { logE('onCalChange_: error', { error: err.message }); }
-  finally { logD('onCalChange_: done', { durationMs: durMs_(t0) }); }
+  try {
+    // Use incremental sync to find which events changed, then process only those days
+    const changedDates = getChangedDates_();
+    if (changedDates.length === 0) {
+      // Fallback: if sync token fails, scan next 7 days
+      logI('onCalChange_: no sync data, scanning 7 days');
+      scanDays_(7);
+    } else {
+      logI('onCalChange_: processing changed dates', { dates: changedDates });
+      for (const dateStr of changedDates) {
+        try { processSingleDay_(dateStr); }
+        catch (err) { logW('onCalChange_: day error', { date: dateStr, error: err.message }); }
+      }
+    }
+  } catch (err) {
+    logE('onCalChange_: error, falling back to 7-day scan', { error: err.message });
+    try { scanDays_(7); } catch (e2) {}
+  } finally {
+    logD('onCalChange_: done', { durationMs: durMs_(t0) });
+  }
 }
 
-function scanUpcoming_() {
-  // Prevent concurrent execution (onCalChange_ + polling can fire simultaneously)
+/**
+ * Incremental sync: uses a sync token to get only events that changed since last check.
+ * Returns an array of unique date strings (YYYY-MM-DD) that need reprocessing.
+ */
+function getChangedDates_() {
+  const calId = getProp_('WATCH_CALENDAR_ID', 'primary');
+  const props = PropertiesService.getUserProperties();
+  const syncToken = props.getProperty('SYNC_TOKEN');
+  const dates = new Set();
+
+  try {
+    let resp;
+    if (syncToken) {
+      try {
+        resp = Calendar.Events.list(calId, { syncToken: syncToken });
+      } catch (e) {
+        // Sync token expired (410 error) → do a full init to get a new token
+        logI('getChangedDates_: sync token expired, reinitializing');
+        initSyncToken_();
+        return []; // caller will fallback to scanDays_
+      }
+    } else {
+      // First run: initialize the sync token without processing anything
+      initSyncToken_();
+      return [];
+    }
+
+    // Extract dates from changed events
+    const items = resp.items || [];
+    for (const ev of items) {
+      const dt = ev.start?.dateTime || ev.start?.date;
+      if (dt) dates.add(dt.substring(0, 10));
+      // Also check original start (for moved events)
+      const odt = ev.originalStartTime?.dateTime || ev.originalStartTime?.date;
+      if (odt) dates.add(odt.substring(0, 10));
+    }
+
+    // Store the new sync token for next time
+    if (resp.nextSyncToken) {
+      props.setProperty('SYNC_TOKEN', resp.nextSyncToken);
+    }
+  } catch (e) {
+    logW('getChangedDates_: error', { error: e.message });
+  }
+
+  return Array.from(dates);
+}
+
+/**
+ * Initialize sync token by doing a full list (without processing).
+ * We need to paginate to get the final nextSyncToken.
+ */
+function initSyncToken_() {
+  const calId = getProp_('WATCH_CALENDAR_ID', 'primary');
+  const props = PropertiesService.getUserProperties();
+  const now = new Date();
+
+  let pageToken;
+  let syncToken;
+  do {
+    const resp = Calendar.Events.list(calId, {
+      timeMin: now.toISOString(),
+      pageToken: pageToken
+    });
+    syncToken = resp.nextSyncToken;
+    pageToken = resp.nextPageToken;
+  } while (pageToken);
+
+  if (syncToken) {
+    props.setProperty('SYNC_TOKEN', syncToken);
+    logI('initSyncToken_: initialized');
+  }
+}
+
+/**
+ * Process a single day by date string (YYYY-MM-DD).
+ * Fetches all events for that day and runs processDayChain_.
+ */
+function processSingleDay_(dateStr) {
   const lock = LockService.getScriptLock();
   if (!lock.tryLock(5000)) {
-    logD('scanUpcoming_: skipped, another execution in progress');
+    logD('processSingleDay_: skipped, locked');
+    return;
+  }
+
+  const calId = getProp_('WATCH_CALENDAR_ID', 'primary');
+  const dayStart = new Date(dateStr + 'T00:00:00');
+  const dayEnd = new Date(dayStart.getTime() + hours_(24));
+
+  try {
+    const resp = Calendar.Events.list(calId, {
+      timeMin: dayStart.toISOString(), timeMax: dayEnd.toISOString(),
+      singleEvents: true, maxResults: 250, orderBy: 'startTime'
+    });
+    const events = resp.items || [];
+    logI('processSingleDay_: fetched', { date: dateStr, count: events.length });
+    processDayChain_(calId, events, false);
+  } catch (e) {
+    logE('processSingleDay_: error', { date: dateStr, error: e.message });
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/**
+ * Scan N days ahead. Used by poll (7 days) and deep scan (30 days).
+ */
+function scanDays_(days) {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(5000)) {
+    logD('scanDays_: skipped, locked');
     return;
   }
 
   const t0 = Date.now();
   const calId = getProp_('WATCH_CALENDAR_ID', 'primary');
-  const lookaheadH = getNumProp_('SCAN_LOOKAHEAD_HOURS', 48);
   const now = new Date();
-  const maxT = new Date(now.getTime() + hours_(lookaheadH));
+  const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
+  const maxT = new Date(dayStart.getTime() + hours_(days * 24));
 
   try {
     const resp = Calendar.Events.list(calId, {
-      timeMin: now.toISOString(), timeMax: maxT.toISOString(),
+      timeMin: dayStart.toISOString(), timeMax: maxT.toISOString(),
       singleEvents: true, maxResults: 250, orderBy: 'startTime'
     });
     const allEvents = resp.items || [];
-    logI('scanUpcoming_: fetched', { count: allEvents.length });
+    logI('scanDays_: fetched', { days, count: allEvents.length });
 
     const dayGroups = groupByDate_(allEvents);
     for (const [dateStr, events] of Object.entries(dayGroups)) {
       try { processDayChain_(calId, events, false); }
-      catch (e) { logE('scanUpcoming_: chain error', { date: dateStr, error: e.message }); }
+      catch (e) { logE('scanDays_: chain error', { date: dateStr, error: e.message }); }
     }
   } catch (e) {
-    logE('scanUpcoming_: list failed', { error: e.message });
+    logE('scanDays_: list failed', { error: e.message });
   } finally {
     lock.releaseLock();
   }
-  logI('scanUpcoming_: done', { durationMs: durMs_(t0) });
+  logI('scanDays_: done', { days, durationMs: durMs_(t0) });
+}
+
+/** Poll trigger: scans next 7 days. */
+function scanUpcoming_() {
+  scanDays_(7);
 }
 
 function morningSweep_() {
