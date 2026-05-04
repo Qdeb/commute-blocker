@@ -1,6 +1,6 @@
 # 🚲 Auto Commute Blocker — Google Calendar
 
-Crée automatiquement des blocs "Travel" dans Google Calendar avant et après chaque réunion physique, avec le temps de trajet réel (vélo ou transports en commun) + un buffer configurable.
+Crée automatiquement des blocs "Travel" dans Google Calendar avant et après chaque réunion physique, avec le temps de trajet réel (vélo ou transports en commun) + un buffer configurable. Gère aussi les déplacements longue distance : les events train/avion génèrent des blocs d'accès à la gare/aéroport, et les séjours multi-jours ancrent automatiquement les meetings suivants à l'hôtel.
 
 Les blocs apparaissent comme **occupé** → personne ne peut booker par-dessus ton temps de trajet.
 
@@ -16,42 +16,51 @@ Les blocs apparaissent comme **occupé** → personne ne peut booker par-dessus 
 | `scanUpcoming_` | Toutes les 30min (configurable) | **7 prochains jours** | Filet de sécurité. Rattrape ce que le hook a manqué. |
 | `morningSweep_` | 1x/jour à 7h | **Aujourd'hui** | Vérifie les conflits non résolus, envoie un email si problème. |
 
-### Logique principale
+### Logique principale — réunions
 
 Pour chaque réunion physique de la journée (triées par heure) :
 
-1. **Résout l'origine** : d'où tu pars ?
-   - 1ère réunion dans les 90min du début de journée → toujours depuis la maison
-   - Réunion précédente < 90min avant → trajet direct A→B (chaînage)
-   - Réunion précédente entre 90min et 2h avant → vérifie si un aller-retour maison/bureau tient dans le gap. Si oui → retour + départ depuis maison/bureau. Si non → trajet direct A→B
-   - Aucune réunion dans les 2h → départ depuis maison ou bureau (selon Workspace)
-2. **Si destination = maison** → pas de bloc trajet
-3. **Mode de transport** : vélo si les 2 points sont dans Paris et trajet ≤ 45min, sinon transports en commun
-4. **Appel Google Directions API** → durée réelle + buffer
-5. **Résolution de conflits** : si le trajet chevauche une visio ou un "time block" → décalé avant automatiquement (récursif). Si il chevauche une réunion physique → email d'alerte
+1. **Résout l'origine** via timeline anchor : destination du dernier train/avion → hôtel actif → meeting précédent (si chaîné) → maison/bureau.
+2. **Si destination = ancrage actuel** → pas de bloc trajet.
+3. **Mode de transport** : vélo si les 2 points sont dans Paris et trajet ≤ 45min, sinon transports en commun.
+4. **Appel Google Directions API** → durée réelle + buffer.
+5. **Résolution de conflits** : si le trajet chevauche une visio ou un "time block" → décalé avant automatiquement (récursif). Si il chevauche une réunion physique → email d'alerte.
 
 ### Retour intra-journée
 
 Après chaque réunion physique, si le prochain meeting physique est à plus de 90min :
-- Calcule si un aller-retour (meeting → maison/bureau → prochain meeting) tient dans le gap
-- Si oui → crée un bloc retour
-- Si non → pas de retour, le prochain trajet sera direct A→B
+- Calcule si un aller-retour (meeting → maison/bureau → prochain meeting) tient dans le gap.
+- Si oui → crée un bloc retour.
+- Si non → pas de retour, le prochain trajet sera direct A→B.
 
 ### Retour fin de journée
 
-- Après le dernier meeting physique → toujours un retour
-- Après l'heure de coupure (configurable, défaut 17h) → toujours vers la maison (jamais le bureau)
-- Si une nuit d'hôtel est détectée → retour vers l'hôtel à la place
+- Après le dernier meeting physique → bloc retour.
+- Après l'heure de coupure (configurable, défaut 17h) → toujours vers la maison (jamais le bureau).
+- Si une nuit d'hôtel est détectée → retour vers l'hôtel à la place.
+
+### Trains / Avions
+
+Les événements dont le titre commence par un mot-clé de transit (par défaut : `Train`, `Flight`, `TGV`, `Vol`) suivi de `to <destination>` sont traités comme du transit, pas comme des meetings. Le script génère :
+
+- **Bloc d'arrivée** : ancrage → gare/aéroport, se terminant à l'heure de départ du transit. Buffer plateforme par mot-clé (10min pour les trains, 90min pour les vols).
+- **Bloc de départ** : gare d'arrivée → maison (ou futur hôtel) à la fin du transit — uniquement si aucun meeting physique ne suit. Sinon, le bloc trajet du meeting suivant gère la sortie en utilisant la destination du transit comme ancrage.
+
+Après la fin d'un événement de transit, sa destination devient l'ancrage timeline pour tout ce qui suit dans la journée, jusqu'au prochain événement de transit.
+
+### Nuits d'hôtel
+
+Deux formats sont reconnus comme ancrages hôtel :
+- **Events nuit avec horaires** — par exemple un event 22h → 8h le lendemain avec une adresse physique.
+- **Events all-day multi-jours avec une adresse** — par exemple les events "Stay at The Standard, Brussels" auto-importés par Google.
+
+Pour les events all-day multi-jours, **le jour où l'event commence est traité comme un jour de transit** : l'hôtel n'est *pas encore* l'ancrage le matin (tu t'es réveillé chez toi). Il devient l'ancrage seulement après qu'un event de transit se déclenche ce jour-là. À partir du lendemain matin, l'hôtel est l'ancrage de tous les meetings jusqu'à la fin du séjour.
 
 ### Bureau / Maison (Google Workspace)
 
-- Si tu as un compte Workspace avec "working location" configuré → le script lit si c'est un jour bureau ou maison et utilise l'adresse correspondante
-- Si tu es sur Gmail personnel → toujours la maison (fallback automatique)
-- La 1ère réunion du matin part toujours de la maison (pas du bureau)
-
-### Nuit d'hôtel
-
-Si un événement dans ton calendrier commence le soir et se termine le lendemain matin avec une adresse physique → le script utilise cette adresse comme point d'ancrage pour le dernier retour de la soirée.
+- Si tu as un compte Workspace avec "working location" configuré → le script lit si c'est un jour bureau ou maison et utilise l'adresse correspondante.
+- Si tu es sur Gmail personnel → toujours la maison (fallback automatique).
+- La 1ère réunion du matin part toujours de la maison (pas du bureau).
 
 ---
 
@@ -110,6 +119,7 @@ Si un événement dans ton calendrier commence le soir et se termine le lendemai
 | `ALERT_EMAIL` | `ton@email.com` | **Ton email** pour alertes de conflit |
 | `LOG_LEVEL` | `INFO` | Verbosité (`DEBUG` pour troubleshoot) |
 | `TRAVEL_COLOR_ID` | `8` | Couleur des blocs (8 = graphite) |
+| `TRANSIT_KEYWORDS` | `Train,Flight,TGV,Vol` | Préfixes de titre détectés comme transit (optionnel) |
 
 > **Aucune donnée personnelle n'est dans le code.** Toute la configuration est dans les Script Properties.
 
@@ -140,7 +150,10 @@ Si un événement dans ton calendrier commence le soir et se termine le lendemai
 | Retour fin de journée | 1 seul meeting physique | Bloc retour après le meeting |
 | Conflit visio | Visio juste avant un meeting physique lointain | Le trajet se décale avant la visio |
 | Email d'alerte | `sweepNow` avec un conflit physique | Email reçu |
-| Nuit d'hôtel | Event 22h→8h lendemain avec adresse | Dernier retour vers l'hôtel |
+| Nuit d'hôtel (horaires) | Event 22h→8h lendemain avec adresse | Dernier retour vers l'hôtel |
+| Séjour hôtel (multi-jours) | Event all-day "Stay at X" sur 2+ jours | L'hôtel devient ancrage à partir du jour 2 |
+| Voyage en train | Event titré `Train to Brussels`, location = `Paris Nord` | Bloc d'arrivée (maison → Paris Nord, +10min plateforme) ; meetings du lendemain partent depuis `Brussels` |
+| Voyage en avion | Event titré `Flight to JFK`, location = aéroport | Bloc d'arrivée avec +90min buffer aéroport |
 
 ---
 
@@ -152,6 +165,9 @@ Si un événement dans ton calendrier commence le soir et se termine le lendemai
 | `setup()` | Installer les triggers (1 fois) |
 | `scanNow()` | Test manuel — scanne les 7 prochains jours |
 | `sweepNow()` | Test manuel — simule le sweep du matin |
+| `debugDay()` | Affiche tout ce que le script voit sur une date donnée (modifie `DEBUG_DATE`) |
+| `debugListConsistency()` | Sonde la fraîcheur de Calendar.Events.list — diagnostic uniquement |
+| `emergencyCleanupTravelDuplicates()` | Dedup ponctuel sur les 60 prochains jours |
 
 ---
 
@@ -163,6 +179,12 @@ Si un événement dans ton calendrier commence le soir et se termine le lendemai
 - **Seuil vélo** : ajuste `CYCLING_MAX_MINUTES` (défaut 45min)
 - **Transit uniquement** : mets `CYCLING_MAX_MINUTES` à `0`
 - **Vélo uniquement** : mets `CYCLING_MAX_MINUTES` à `999`
+
+### Adapter les mots-clés transit
+
+- Mots-clés par défaut : `Train`, `Flight`, `TGV`, `Vol` (anglais + français)
+- Override via la Script Property `TRANSIT_KEYWORDS` (séparés par virgule)
+- Le buffer plateforme par mot-clé est hardcodé dans `TRANSIT_PLATFORM_BUFFERS` (Train/TGV : 10min, Flight/Vol : 90min)
 
 ### Couleurs Google Calendar
 
@@ -208,12 +230,14 @@ La description contient : origine → destination, mode, lien Google Maps cliqua
 | Problème | Solution |
 |---|---|
 | `onEventUpdated` échoue au setup | Relance `setup()` 2-3 fois. Intermittent côté Google. Le polling 30min prend le relai. |
-| Duplicatas de travel blocks | Corrigé avec `LockService` + `privateExtendedProperty` filter. Lance `scanNow()` pour nettoyer. |
+| Duplicatas de travel blocks | Ne devrait plus arriver — le dedup utilise le snapshot in-memory du jour, pas un second list call. Si ça arrive quand même, le log d'exécution affichera un WARN `multiple matches in dayEvents — collapsing` avec la trace complète. Lance `emergencyCleanupTravelDuplicates()` pour vider le backlog. |
 | Pas de bloc créé | Vérifie : adresse physique dans le champ location, meeting accepté, destination ≠ maison. Passe en `DEBUG`. |
 | Pas de bloc au 1er lancement | Normal : le sync token s'initialise. Les blocs se créent à partir de la 2ème modif. Lance `scanNow()` pour forcer. |
 | Mauvais mode transport | Vélo uniquement si les 2 points sont dans la bounding box ET ≤ 45min. |
 | Working location ignoré | Nécessite Google Workspace. Sur Gmail personnel → toujours maison. |
 | Synchro plus lente sur mobile | Normal : Google Calendar sur mobile synchronise moins fréquemment que sur desktop. |
+| Ancrage hôtel utilisé le jour d'arrivée | Comportement attendu : le jour où un séjour multi-jours commence, tu es traité comme étant chez toi. L'hôtel devient l'ancrage seulement après un event de transit (ou à partir du jour 2 du séjour). |
+| Event train traité comme un meeting | Le titre doit commencer par un mot-clé de transit suivi de ` to ` (ex : `Train to Brussels`). Sinon il est classé comme meeting standard. |
 
 ---
 

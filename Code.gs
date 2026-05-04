@@ -1,15 +1,26 @@
 /** ------------------------------------------------------------
- * Auto Commute Blocker for Google Calendar — V3
- * 
+ * Auto Commute Blocker for Google Calendar — V5
+ *
  * Creates "Travel" time blocks before/after meetings with physical locations.
  * Chains meetings (origin = previous meeting location, not always home).
  * Cycling in Paris (<45min), transit otherwise.
  * Auto-shifts travel before virtual meetings when overlap detected.
  * Intra-day returns: if gap between meetings allows round-trip home, adds return.
- * Hotel nights: if an event spanning overnight has a location, use it as anchor.
- * After 17h: always return home (not office).
- * Emails alerts only for unresolvable conflicts.
- * 
+ *
+ * V5 changes:
+ *   - All-day multi-day events with a location are treated as hotel anchors.
+ *   - "First-day exception": on the day a multi-day all-day hotel event STARTS,
+ *     hotel is NOT yet anchor — you woke up at home. It only becomes anchor
+ *     after a transit event fires that day.
+ *   - Transit events generate ARRIVAL travel (anchor → departure station)
+ *     and DEPARTURE travel (arrival station → home/hotel) when applicable.
+ *   - Per-keyword platform buffers (Train: 10min, Flight: 90min, etc.).
+ *   - getActiveHotelAt_ / getActiveHotelAfter_ helpers replace day-wide
+ *     findHotelNight_ for time-aware anchor resolution.
+ *   - Bug fixes from V4:
+ *     - _depart block now uses departMode.durationMs (was arriveMode, undefined).
+ *     - dateStr falls back to all-day events when no timed event present.
+ *
  * Based on Auto Drive-Time Blocker by Mathew Varghese (MIT License).
  *
  * SCRIPT PROPERTIES (Project Settings → Script properties):
@@ -18,17 +29,17 @@
  *   BUFFER_MINUTES         -> "10"
  *   WATCH_CALENDAR_ID      -> "primary"
  *   GOOGLE_MAPS_API_KEY    -> Directions API key
- *   SCAN_LOOKAHEAD_HOURS   -> "730" (default ~1 month)
- *   POLL_INTERVAL_MINUTES  -> "30" (fallback polling frequency; onCalChange_ handles real-time)
+ *   POLL_INTERVAL_MINUTES  -> "30"
  *   DAY_START_HOUR         -> "9"
  *   FIRST_MEETING_WINDOW   -> "90"
  *   CHAIN_WINDOW_MINUTES   -> "120"
  *   NEXT_MEETING_WINDOW    -> "90"
  *   CYCLING_MAX_MINUTES    -> "45"
- *   EVENING_CUTOFF_HOUR    -> "17" (after this hour, always return home not office)
+ *   EVENING_CUTOFF_HOUR    -> "17"
  *   ALERT_EMAIL            -> "your@email.com"
  *   LOG_LEVEL              -> "INFO"
  *   TRAVEL_COLOR_ID        -> "8"
+ *   TRANSIT_KEYWORDS       -> "Train,Flight,TGV,Vol" (title prefixes; default if unset)
  *
  * SETUP:
  *   1. Apps Script: Services → + → Calendar API (Advanced)
@@ -46,11 +57,6 @@ const LOG_LEVELS = { ERROR: 0, WARN: 1, INFO: 2, DEBUG: 3 };
 function getLogLevel_() {
   const lvl = (PROPS.getProperty('LOG_LEVEL') || 'INFO').toUpperCase();
   return LOG_LEVELS[lvl] ?? LOG_LEVELS.INFO;
-}
-function mask_(s, keep = 4) {
-  if (!s) return s;
-  const str = String(s);
-  return str.length <= keep ? '****' : `${str.slice(0, keep)}****`;
 }
 function nowIso_() { return new Date().toISOString(); }
 function durMs_(t0) { return Date.now() - t0; }
@@ -80,11 +86,45 @@ function getNumProp_(key, fallback) {
 function minutes_(n) { return n * 60 * 1000; }
 function hours_(n)   { return n * 60 * 60 * 1000; }
 
+/**
+ * Paginated Calendar.Events.list — accumulates all pages so a busy day with
+ * >250 events doesn't silently truncate. Returns the items array.
+ */
+function listAllEventsInWindow_(calId, timeMin, timeMax, extraOpts) {
+  const items = [];
+  let pageToken;
+  do {
+    const resp = Calendar.Events.list(calId, Object.assign({
+      timeMin: timeMin, timeMax: timeMax,
+      singleEvents: true, maxResults: 250,
+      orderBy: 'startTime', pageToken: pageToken,
+    }, extraOpts || {}));
+    if (resp.items) items.push(...resp.items);
+    pageToken = resp.nextPageToken;
+  } while (pageToken);
+  return items;
+}
+
+/** Find all travel blocks in `events` that match a given forEventId. */
+function findBlockInList_(events, forEventId) {
+  return (events || []).filter(ev =>
+    ev.extendedProperties?.private?.travelForEventId === forEventId
+  );
+}
+
+/** Remove an event by id from a working dayEvents array (mutates). */
+function consumeBlock_(events, blockId) {
+  const i = events.findIndex(ev => ev.id === blockId);
+  if (i >= 0) events.splice(i, 1);
+}
+
 function hasPhysicalLocation_(ev) {
   const loc = (ev.location || '').trim();
   if (!loc) return false;
   if (/^https?:\/\//i.test(loc)) return false;
   if (/^(meet\.google|zoom\.us|teams\.microsoft)/i.test(loc)) return false;
+  // Catch French/English virtual-meeting labels (no URL form)
+  if (/(microsoft\s*teams|google\s*meet|zoom\b|réunion|webex|webcall)/i.test(loc)) return false;
   return true;
 }
 function isAccepted_(ev) {
@@ -96,6 +136,161 @@ function isAccepted_(ev) {
 function isUserTimeBlock_(ev) {
   return (ev.summary || '').toLowerCase().includes('time block');
 }
+
+// ----- Transit detection -----
+
+const DEFAULT_TRANSIT_KEYWORDS = ['Train', 'Flight', 'TGV', 'Vol'];
+
+function getTransitKeywords_() {
+  const raw = getProp_('TRANSIT_KEYWORDS', '');
+  if (!raw) return DEFAULT_TRANSIT_KEYWORDS;
+  return raw.split(',').map(s => s.trim()).filter(Boolean);
+}
+
+/**
+ * Per-keyword platform buffer in minutes (added on top of global BUFFER_MINUTES).
+ * TODO: make configurable via TRANSIT_PLATFORM_BUFFERS script property if needed.
+ */
+const TRANSIT_PLATFORM_BUFFERS = {
+  Train: 10,
+  TGV: 10,
+  Flight: 90,
+  Vol: 90,
+};
+
+function getTransitPlatformBuffer_(ev) {
+  const title = (ev.summary || '').trim();
+  for (const kw of Object.keys(TRANSIT_PLATFORM_BUFFERS)) {
+    const re = new RegExp(`^${kw}\\s+to\\s+`, 'i');
+    if (re.test(title)) return TRANSIT_PLATFORM_BUFFERS[kw];
+  }
+  return 10;
+}
+
+function isTransitEvent_(ev) {
+  if (isTravelBlock_(ev)) return false;
+  const title = (ev.summary || '').trim();
+  if (!title) return false;
+  const keywords = getTransitKeywords_();
+  for (const kw of keywords) {
+    const re = new RegExp(`^${kw}\\s+to\\s+`, 'i');
+    if (re.test(title)) return true;
+  }
+  return false;
+}
+
+function parseTransitDestination_(ev) {
+  const title = (ev.summary || '').trim();
+  const keywords = getTransitKeywords_();
+  for (const kw of keywords) {
+    const re = new RegExp(`^${kw}\\s+to\\s+(.+)$`, 'i');
+    const m = title.match(re);
+    if (m) return m[1].trim();
+  }
+  return null;
+}
+
+// ----- Hotel detection -----
+
+/**
+ * True if an event is a multi-day stay (hotel night) — used as anchor only,
+ * never gets travel blocks generated for it. Two formats supported:
+ *   - Timed event spanning overnight (e.g. 22:30 → 09:30 next day)
+ *   - All-day event spanning multiple calendar days ("Stay at X")
+ */
+function isHotelNightEvent_(ev) {
+  if (!hasPhysicalLocation_(ev)) return false;
+
+  if (ev.start?.dateTime && ev.end?.dateTime) {
+    const startDate = new Date(ev.start.dateTime).toISOString().substring(0, 10);
+    const endDate = new Date(ev.end.dateTime).toISOString().substring(0, 10);
+    return endDate > startDate;
+  }
+
+  if (ev.start?.date && ev.end?.date) {
+    const startMs = new Date(ev.start.date + 'T00:00:00').getTime();
+    const endMs = new Date(ev.end.date + 'T00:00:00').getTime();
+    return endMs - startMs >= 2 * 24 * 60 * 60 * 1000;
+  }
+
+  return false;
+}
+
+/**
+ * Returns hotel address if targetTime is "inside" an active hotel-trip span.
+ *
+ * First-day exception: on the day a multi-day all-day hotel event STARTS,
+ * hotel is NOT yet anchor — you woke up at home. It only becomes anchor after
+ * a transit event fires that day.
+ *
+ * For timed overnight events (22:30 → 09:30), targetTime must be ≥ start time.
+ */
+function getActiveHotelAt_(dayEvents, targetTime) {
+  const targetMs = targetTime.getTime();
+  let mostRecent = null;
+  let mostRecentStartMs = 0;
+
+  for (const ev of dayEvents) {
+    if (!isHotelNightEvent_(ev)) continue;
+
+    let startMs, endMs, isFirstDay;
+    if (ev.start.dateTime) {
+      startMs = new Date(ev.start.dateTime).getTime();
+      endMs = new Date(ev.end.dateTime).getTime();
+      if (targetMs < startMs) continue;
+      isFirstDay = false;
+    } else {
+      startMs = new Date(ev.start.date + 'T00:00:00').getTime();
+      endMs = new Date(ev.end.date + 'T00:00:00').getTime();
+      if (targetMs < startMs || targetMs >= endMs) continue;
+      const targetDate = new Date(targetMs).toISOString().substring(0, 10);
+      isFirstDay = (targetDate === ev.start.date);
+    }
+
+    if (isFirstDay) {
+      // First day: only active if a transit event has already fired today
+      const dayStart = new Date(targetMs);
+      dayStart.setHours(0, 0, 0, 0);
+      const dayStartMs = dayStart.getTime();
+      const transitFiredToday = dayEvents.some(other => {
+        if (!isTransitEvent_(other)) return false;
+        if (!other.end?.dateTime) return false;
+        const otherEndMs = new Date(other.end.dateTime).getTime();
+        return otherEndMs >= dayStartMs && otherEndMs <= targetMs;
+      });
+      if (!transitFiredToday) continue;
+    }
+
+    if (startMs > mostRecentStartMs) {
+      mostRecent = ev;
+      mostRecentStartMs = startMs;
+    }
+  }
+
+  return mostRecent ? mostRecent.location.trim() : null;
+}
+
+/**
+ * Returns hotel address for a hotel-trip that starts AFTER afterTime.
+ * Used to find "where am I sleeping tonight" after a meeting or transit ends.
+ */
+function getActiveHotelAfter_(dayEvents, afterTime) {
+  const afterMs = afterTime.getTime();
+  for (const ev of dayEvents) {
+    if (!isHotelNightEvent_(ev)) continue;
+    let startMs;
+    if (ev.start.dateTime) {
+      startMs = new Date(ev.start.dateTime).getTime();
+    } else {
+      startMs = new Date(ev.start.date + 'T00:00:00').getTime();
+    }
+    if (startMs >= afterMs) return ev.location.trim();
+  }
+  return null;
+}
+
+// ----- Misc helpers -----
+
 function shortPlace_(loc) {
   return (loc || '').split(',')[0].trim() || loc || 'destination';
 }
@@ -103,36 +298,19 @@ function mapsUrl_(origin, destination, mode) {
   const base = 'https://www.google.com/maps/dir/?api=1';
   return `${base}&origin=${encodeURIComponent(origin)}&destination=${encodeURIComponent(destination)}&travelmode=${mode === 'bicycling' ? 'bicycling' : 'transit'}`;
 }
-
-/**
- * Normalize an address for comparison.
- * Lowercase, trim, remove trailing country, collapse whitespace.
- */
 function normalizeAddr_(addr) {
   return (addr || '').toLowerCase().trim().replace(/,?\s*france\s*$/i, '').replace(/\s+/g, ' ').trim();
 }
-
-/** Check if two addresses refer to the same place (fuzzy). */
 function sameLocation_(a, b) {
   return normalizeAddr_(a) === normalizeAddr_(b);
 }
 
 /**
- * Get the "anchor" location (home or office) for a specific date/time.
- * 
- * Tries to read Google Workspace working location events.
- * - If a workingLocation event exists for this time with type 'officeLocation' → return OFFICE_ADDRESS
- * - If a workingLocation event exists with type 'homeOffice' → return HOME_ADDRESS
- * - If no working location events (Gmail personal) → fallback to HOME_ADDRESS
- * 
- * Requires OFFICE_ADDRESS script property to be set for office mode.
- * Results cached per date to avoid repeated API calls.
+ * Get the home/office anchor for a specific date/time using Workspace working location.
  */
 function getAnchorForTime_(calId, dateTime) {
   const home = getProp_('HOME_ADDRESS');
   const office = getProp_('OFFICE_ADDRESS', '');
-  
-  // If no office address configured, always return home
   if (!office) return home;
 
   const dateStr = dateTime.toISOString().substring(0, 10);
@@ -142,61 +320,86 @@ function getAnchorForTime_(calId, dateTime) {
   if (cached) return cached === 'office' ? office : home;
 
   try {
-    // Query workingLocation events for this day
     const dayStart = new Date(dateStr + 'T00:00:00');
     const dayEnd = new Date(dayStart.getTime() + hours_(24));
-    
     const resp = Calendar.Events.list(calId, {
-      timeMin: dayStart.toISOString(),
-      timeMax: dayEnd.toISOString(),
-      singleEvents: true,
-      eventTypes: ['workingLocation'],
-      maxResults: 10,
-      orderBy: 'startTime'
+      timeMin: dayStart.toISOString(), timeMax: dayEnd.toISOString(),
+      singleEvents: true, eventTypes: ['workingLocation'], maxResults: 10, orderBy: 'startTime'
     });
-
     const wlEvents = resp.items || [];
-    
     if (wlEvents.length === 0) {
-      // No working location events → personal Gmail, fallback to home
       cache.put(cacheKey, 'home', 3600);
       return home;
     }
-
-    // Find the working location event that covers the requested time
     const targetMs = dateTime.getTime();
     for (const ev of wlEvents) {
-      const evStart = ev.start?.dateTime ? new Date(ev.start.dateTime).getTime() 
+      const evStart = ev.start?.dateTime ? new Date(ev.start.dateTime).getTime()
                     : ev.start?.date ? new Date(ev.start.date).getTime() : 0;
       const evEnd = ev.end?.dateTime ? new Date(ev.end.dateTime).getTime()
                   : ev.end?.date ? new Date(ev.end.date).getTime() : Infinity;
-      
       if (targetMs >= evStart && targetMs < evEnd) {
         const wlProps = ev.workingLocationProperties;
         if (wlProps) {
           if (wlProps.officeLocation) {
-            logD('getAnchorForTime_: office day', { date: dateStr, label: wlProps.officeLocation.label });
             cache.put(cacheKey, 'office', 3600);
             return office;
           }
           if (wlProps.homeOffice !== undefined) {
-            logD('getAnchorForTime_: home day', { date: dateStr });
             cache.put(cacheKey, 'home', 3600);
             return home;
           }
         }
       }
     }
-
-    // No matching working location → default to home
     cache.put(cacheKey, 'home', 3600);
     return home;
   } catch (e) {
-    // API error (likely personal Gmail without Workspace) → fallback to home
     logD('getAnchorForTime_: working location not available, using home', { error: e.message });
     cache.put(cacheKey, 'home', 3600);
     return home;
   }
+}
+
+/**
+ * Resolve the user's location at a given moment.
+ *
+ * Priority:
+ *   1. Most recent transit event ended before targetTime → its destination
+ *   2. Active hotel covering targetTime → hotel address
+ *   3. Workspace working location → home or office
+ *
+ * Transit takes precedence over hotel: if you took a train somewhere AND have
+ * a hotel night, the most recent transit destination wins until you transit again.
+ */
+function resolveTimelineAnchor_(calId, dayEvents, targetTime) {
+  const targetMs = targetTime.getTime();
+
+  let mostRecentTransit = null;
+  for (const ev of dayEvents) {
+    if (!isTransitEvent_(ev)) continue;
+    if (!ev.end?.dateTime) continue;
+    const endMs = new Date(ev.end.dateTime).getTime();
+    if (endMs > targetMs) continue;
+    if (!mostRecentTransit || endMs > new Date(mostRecentTransit.end.dateTime).getTime()) {
+      mostRecentTransit = ev;
+    }
+  }
+
+  if (mostRecentTransit) {
+    const dest = parseTransitDestination_(mostRecentTransit);
+    if (dest) {
+      logD('resolveTimelineAnchor_: using transit destination', { dest });
+      return dest;
+    }
+  }
+
+  const activeHotel = getActiveHotelAt_(dayEvents, targetTime);
+  if (activeHotel) {
+    logD('resolveTimelineAnchor_: using hotel anchor', { hotel: shortPlace_(activeHotel) });
+    return activeHotel;
+  }
+
+  return getAnchorForTime_(calId, targetTime);
 }
 
 const PARIS_BOUNDS = {
@@ -240,10 +443,13 @@ function setup() {
 function onCalChange_(e) {
   const t0 = Date.now();
   try {
-    // Use incremental sync to find which events changed, then process only those days
-    const changedDates = getChangedDates_();
+    const sync = getChangedDates_();
+    if (sync.selfOnly) {
+      logD('onCalChange_: self-trigger guard, skipping', { count: sync.totalChanged });
+      return;
+    }
+    const changedDates = sync.dates;
     if (changedDates.length === 0) {
-      // Fallback: if sync token fails, scan next 7 days
       logI('onCalChange_: no sync data, scanning 7 days');
       scanDays_(7);
     } else {
@@ -261,15 +467,13 @@ function onCalChange_(e) {
   }
 }
 
-/**
- * Incremental sync: uses a sync token to get only events that changed since last check.
- * Returns an array of unique date strings (YYYY-MM-DD) that need reprocessing.
- */
 function getChangedDates_() {
   const calId = getProp_('WATCH_CALENDAR_ID', 'primary');
   const props = PropertiesService.getUserProperties();
   const syncToken = props.getProperty('SYNC_TOKEN');
   const dates = new Set();
+  let totalChanged = 0;
+  let nonSelfChanged = 0;
 
   try {
     let resp;
@@ -277,28 +481,31 @@ function getChangedDates_() {
       try {
         resp = Calendar.Events.list(calId, { syncToken: syncToken });
       } catch (e) {
-        // Sync token expired (410 error) → do a full init to get a new token
         logI('getChangedDates_: sync token expired, reinitializing');
         initSyncToken_();
-        return []; // caller will fallback to scanDays_
+        return { dates: [], selfOnly: false, totalChanged: 0 };
       }
     } else {
-      // First run: initialize the sync token without processing anything
       initSyncToken_();
-      return [];
+      return { dates: [], selfOnly: false, totalChanged: 0 };
     }
 
-    // Extract dates from changed events
     const items = resp.items || [];
+    totalChanged = items.length;
     for (const ev of items) {
+      // Skip cancelled events entirely — they often arrive without summary or
+      // extendedProperties, so isTravelBlock_ can't classify them. Counting
+      // them as "non-self" causes the self-trigger guard to fail when our
+      // own writes cascade through (delete+reinsert during dedup, etc).
+      if (ev.status === 'cancelled') continue;
+      if (isTravelBlock_(ev)) continue;
+      nonSelfChanged++;
       const dt = ev.start?.dateTime || ev.start?.date;
       if (dt) dates.add(dt.substring(0, 10));
-      // Also check original start (for moved events)
       const odt = ev.originalStartTime?.dateTime || ev.originalStartTime?.date;
       if (odt) dates.add(odt.substring(0, 10));
     }
 
-    // Store the new sync token for next time
     if (resp.nextSyncToken) {
       props.setProperty('SYNC_TOKEN', resp.nextSyncToken);
     }
@@ -306,13 +513,10 @@ function getChangedDates_() {
     logW('getChangedDates_: error', { error: e.message });
   }
 
-  return Array.from(dates);
+  const selfOnly = totalChanged > 0 && nonSelfChanged === 0;
+  return { dates: Array.from(dates), selfOnly, totalChanged };
 }
 
-/**
- * Initialize sync token by doing a full list (without processing).
- * We need to paginate to get the final nextSyncToken.
- */
 function initSyncToken_() {
   const calId = getProp_('WATCH_CALENDAR_ID', 'primary');
   const props = PropertiesService.getUserProperties();
@@ -335,14 +539,12 @@ function initSyncToken_() {
   }
 }
 
-/**
- * Process a single day by date string (YYYY-MM-DD).
- * Fetches all events for that day and runs processDayChain_.
- */
 function processSingleDay_(dateStr) {
   const lock = LockService.getScriptLock();
-  if (!lock.tryLock(5000)) {
-    logD('processSingleDay_: skipped, locked');
+  try {
+    lock.waitLock(20000);
+  } catch (e) {
+    logW('processSingleDay_: lock timeout, skipping', { date: dateStr });
     return;
   }
 
@@ -351,13 +553,9 @@ function processSingleDay_(dateStr) {
   const dayEnd = new Date(dayStart.getTime() + hours_(24));
 
   try {
-    const resp = Calendar.Events.list(calId, {
-      timeMin: dayStart.toISOString(), timeMax: dayEnd.toISOString(),
-      singleEvents: true, maxResults: 250, orderBy: 'startTime'
-    });
-    const events = resp.items || [];
+    const events = listAllEventsInWindow_(calId, dayStart.toISOString(), dayEnd.toISOString());
     logI('processSingleDay_: fetched', { date: dateStr, count: events.length });
-    processDayChain_(calId, events, false);
+    processDayChain_(calId, events, false, dateStr);
   } catch (e) {
     logE('processSingleDay_: error', { date: dateStr, error: e.message });
   } finally {
@@ -365,13 +563,12 @@ function processSingleDay_(dateStr) {
   }
 }
 
-/**
- * Scan N days ahead. Used by poll (7 days) and deep scan (30 days).
- */
 function scanDays_(days) {
   const lock = LockService.getScriptLock();
-  if (!lock.tryLock(5000)) {
-    logD('scanDays_: skipped, locked');
+  try {
+    lock.waitLock(20000);
+  } catch (e) {
+    logW('scanDays_: lock timeout, skipping', { days });
     return;
   }
 
@@ -382,27 +579,26 @@ function scanDays_(days) {
   const maxT = new Date(dayStart.getTime() + hours_(days * 24));
 
   try {
-    const resp = Calendar.Events.list(calId, {
-      timeMin: dayStart.toISOString(), timeMax: maxT.toISOString(),
-      singleEvents: true, maxResults: 250, orderBy: 'startTime'
-    });
-    const allEvents = resp.items || [];
-    logI('scanDays_: fetched', { days, count: allEvents.length });
-
-    const dayGroups = groupByDate_(allEvents);
-    for (const [dateStr, events] of Object.entries(dayGroups)) {
-      try { processDayChain_(calId, events, false); }
-      catch (e) { logE('scanDays_: chain error', { date: dateStr, error: e.message }); }
+    // For each day in window, fetch events that touch that day and process.
+    // Per-day fetch ensures multi-day events (hotels) are visible to the day
+    // they overlap — they wouldn't be if we just grouped by start.dateTime.
+    for (let i = 0; i < days; i++) {
+      const t = new Date(dayStart.getTime() + hours_(i * 24));
+      const dateStr = t.toISOString().substring(0, 10);
+      const dEnd = new Date(t.getTime() + hours_(24));
+      try {
+        const events = listAllEventsInWindow_(calId, t.toISOString(), dEnd.toISOString());
+        processDayChain_(calId, events, false, dateStr);
+      } catch (e) {
+        logE('scanDays_: chain error', { date: dateStr, error: e.message });
+      }
     }
-  } catch (e) {
-    logE('scanDays_: list failed', { error: e.message });
   } finally {
     lock.releaseLock();
   }
   logI('scanDays_: done', { days, durationMs: durMs_(t0) });
 }
 
-/** Poll trigger: scans next 7 days. */
 function scanUpcoming_() {
   scanDays_(7);
 }
@@ -414,13 +610,11 @@ function morningSweep_() {
   const now = new Date();
   const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
   const dayEnd = new Date(dayStart.getTime() + hours_(24));
+  const dateStr = dayStart.toISOString().substring(0, 10);
 
   try {
-    const resp = Calendar.Events.list(calId, {
-      timeMin: dayStart.toISOString(), timeMax: dayEnd.toISOString(),
-      singleEvents: true, maxResults: 250, orderBy: 'startTime'
-    });
-    const conflicts = processDayChain_(calId, resp.items || [], true);
+    const events = listAllEventsInWindow_(calId, dayStart.toISOString(), dayEnd.toISOString());
+    const conflicts = processDayChain_(calId, events, true, dateStr);
     if (conflicts && conflicts.length > 0) sendConflictEmail_(conflicts, now);
     else logI('morningSweep_: no conflicts');
   } catch (e) {
@@ -432,56 +626,176 @@ function morningSweep_() {
 function scanNow() { console.log('scanNow()'); scanUpcoming_(); }
 function sweepNow() { console.log('sweepNow()'); morningSweep_(); }
 
-// ===================== CORE CHAIN LOGIC =====================
-
-function groupByDate_(events) {
-  const groups = {};
-  for (const ev of events) {
-    const dt = ev.start?.dateTime;
-    if (!dt) continue;
-    const dateStr = dt.substring(0, 10);
-    if (!groups[dateStr]) groups[dateStr] = [];
-    groups[dateStr].push(ev);
-  }
-  return groups;
-}
+// ===================== CLEANUP UTILITIES =====================
 
 /**
- * Detect a hotel night: an event that spans overnight with a physical address.
- * Returns the hotel address or null.
+ * EMERGENCY CLEANUP — remove duplicate travel blocks.
+ * Run from the Apps Script editor.
  */
-function findHotelNight_(dayEvents, dateStr) {
-  for (const ev of dayEvents) {
-    if (!ev.start?.dateTime || !ev.end?.dateTime) continue;
-    if (!hasPhysicalLocation_(ev)) continue;
-    const start = new Date(ev.start.dateTime);
-    const end = new Date(ev.end.dateTime);
-    // Spans overnight: starts in the evening and ends the next day (or later)
-    const startDate = start.toISOString().substring(0, 10);
-    const endDate = end.toISOString().substring(0, 10);
-    if (startDate === dateStr && endDate > dateStr) {
-      return ev.location.trim();
+function emergencyCleanupTravelDuplicates() {
+  const calId = getProp_('WATCH_CALENDAR_ID', 'primary');
+  const now = new Date();
+  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
+  const end = new Date(start.getTime() + hours_(60 * 24));
+
+  const allTravelBlocks = [];
+  let pageToken;
+  do {
+    const resp = Calendar.Events.list(calId, {
+      timeMin: start.toISOString(), timeMax: end.toISOString(),
+      singleEvents: true, maxResults: 250, pageToken: pageToken,
+    });
+    for (const ev of (resp.items || [])) {
+      if (isTravelBlock_(ev)) allTravelBlocks.push(ev);
     }
-    // Or started the day before and ends today
-    if (startDate < dateStr && endDate >= dateStr) {
-      return ev.location.trim();
+    pageToken = resp.nextPageToken;
+  } while (pageToken);
+
+  logI('emergencyCleanup: scanned', { total: allTravelBlocks.length });
+
+  const groups = {};
+  const orphanGroups = {};
+  for (const b of allTravelBlocks) {
+    const forId = b.extendedProperties?.private?.travelForEventId;
+    if (forId) {
+      if (!groups[forId]) groups[forId] = [];
+      groups[forId].push(b);
+    } else {
+      const key = `${b.start?.dateTime}|${b.summary}`;
+      if (!orphanGroups[key]) orphanGroups[key] = [];
+      orphanGroups[key].push(b);
     }
   }
-  return null;
+
+  let removed = 0;
+  let rateLimitHit = false;
+  const purgeGroup = (blocks) => {
+    if (rateLimitHit || blocks.length <= 1) return;
+    blocks.sort((a, b) => new Date(a.created) - new Date(b.created));
+    for (let i = 1; i < blocks.length; i++) {
+      if (rateLimitHit) return;
+      try {
+        Calendar.Events.remove(calId, blocks[i].id);
+        removed++;
+        Utilities.sleep(250);
+      } catch (e) {
+        if (/rate.?limit/i.test(e.message)) {
+          logW('emergencyCleanup: rate limit hit, stopping', { removedSoFar: removed });
+          rateLimitHit = true;
+          return;
+        }
+        logW('emergencyCleanup: remove failed', { id: blocks[i].id, error: e.message });
+      }
+    }
+  };
+  Object.values(groups).forEach(purgeGroup);
+  Object.values(orphanGroups).forEach(purgeGroup);
+
+  logI('emergencyCleanup: done', { removed, kept: allTravelBlocks.length - removed });
+  console.log(`Removed ${removed} duplicate travel blocks. Kept ${allTravelBlocks.length - removed}.`);
 }
+
+function startBackgroundCleanup() {
+  stopBackgroundCleanup();
+  ScriptApp.newTrigger('cleanupTick_').timeBased().everyMinutes(10).create();
+  console.log('Background cleanup started. Trigger fires every 10 min. Run stopBackgroundCleanup() to halt.');
+  cleanupTick_();
+}
+
+function stopBackgroundCleanup() {
+  let removed = 0;
+  for (const t of ScriptApp.getProjectTriggers()) {
+    if (t.getHandlerFunction() === 'cleanupTick_') {
+      ScriptApp.deleteTrigger(t);
+      removed++;
+    }
+  }
+  if (removed > 0) console.log(`Stopped background cleanup (${removed} trigger(s) removed).`);
+  else console.log('No background cleanup trigger was running.');
+}
+
+function cleanupTick_() {
+  const MAX_DELETES_PER_RUN = 50;
+  const SLEEP_MS = 1100;
+
+  const calId = getProp_('WATCH_CALENDAR_ID', 'primary');
+  const now = new Date();
+  const start = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0);
+  const end = new Date(start.getTime() + hours_(60 * 24));
+
+  const allTravelBlocks = [];
+  let pageToken;
+  do {
+    const resp = Calendar.Events.list(calId, {
+      timeMin: start.toISOString(), timeMax: end.toISOString(),
+      singleEvents: true, maxResults: 250, pageToken: pageToken,
+    });
+    for (const ev of (resp.items || [])) {
+      if (isTravelBlock_(ev)) allTravelBlocks.push(ev);
+    }
+    pageToken = resp.nextPageToken;
+  } while (pageToken);
+
+  const groups = {};
+  const orphanGroups = {};
+  for (const b of allTravelBlocks) {
+    const forId = b.extendedProperties?.private?.travelForEventId;
+    if (forId) {
+      if (!groups[forId]) groups[forId] = [];
+      groups[forId].push(b);
+    } else {
+      const key = `${b.start?.dateTime}|${b.summary}`;
+      if (!orphanGroups[key]) orphanGroups[key] = [];
+      orphanGroups[key].push(b);
+    }
+  }
+
+  const toDelete = [];
+  const collectDuplicates = (groupMap) => {
+    for (const blocks of Object.values(groupMap)) {
+      if (blocks.length <= 1) continue;
+      blocks.sort((a, b) => new Date(a.created) - new Date(b.created));
+      for (let i = 1; i < blocks.length; i++) toDelete.push(blocks[i]);
+    }
+  };
+  collectDuplicates(groups);
+  collectDuplicates(orphanGroups);
+
+  logI('cleanupTick_: status', { totalBlocks: allTravelBlocks.length, duplicatesRemaining: toDelete.length });
+
+  if (toDelete.length === 0) {
+    stopBackgroundCleanup();
+    console.log(`✅ Cleanup complete. ${allTravelBlocks.length} travel blocks remain (no duplicates).`);
+    return;
+  }
+
+  let removed = 0;
+  for (let i = 0; i < Math.min(MAX_DELETES_PER_RUN, toDelete.length); i++) {
+    try {
+      Calendar.Events.remove(calId, toDelete[i].id);
+      removed++;
+      Utilities.sleep(SLEEP_MS);
+    } catch (e) {
+      if (/rate.?limit/i.test(e.message)) {
+        logW('cleanupTick_: rate limit hit, will retry next tick', { removedThisRun: removed });
+        break;
+      }
+      logW('cleanupTick_: remove failed', { id: toDelete[i].id, error: e.message });
+    }
+  }
+
+  console.log(`Removed ${removed} this run. ~${toDelete.length - removed} duplicates still remaining.`);
+}
+
+// ===================== CORE CHAIN LOGIC =====================
 
 /**
  * Process a single day's events as an ordered chain.
- * 
- * New in V3:
- *   - Intra-day returns: after each physical meeting, if gap to next > 90min
- *     AND there's time for a round-trip (return + depart), add return block.
- *     If round-trip doesn't fit, keep direct A→B (chain extends to cover gap).
- *   - After 17h: always return home.
- *   - Hotel nights: use hotel address as anchor instead of home.
- *   - Duplicate fix: findTravelBlockFor_ uses full-day window.
+ *
+ * dateStr is required (passed by callers). Used for window bounds and
+ * (indirectly) for hotel detection.
  */
-function processDayChain_(calId, dayEvents, isMorningSweep) {
+function processDayChain_(calId, dayEvents, isMorningSweep, dateStr) {
   const home = getProp_('HOME_ADDRESS');
   const apiKey = getProp_('GOOGLE_MAPS_API_KEY');
   const bufferMin = getNumProp_('BUFFER_MINUTES', 10);
@@ -496,18 +810,7 @@ function processDayChain_(calId, dayEvents, isMorningSweep) {
     return [];
   }
 
-  // Get the date string for hotel detection
-  const dateStr = dayEvents[0]?.start?.dateTime?.substring(0, 10) || '';
-
-  // Check for hotel night (overrides home as anchor for end-of-day)
-  const hotelAddress = findHotelNight_(dayEvents, dateStr);
-  if (hotelAddress) logI('processDayChain_: hotel night detected', { hotel: shortPlace_(hotelAddress) });
-
-  // Full-day window for finding existing travel blocks (FIX: wider search to prevent duplicates)
-  const dayWindowStart = dateStr ? new Date(dateStr + 'T00:00:00') : new Date(Date.now() - hours_(24));
-  const dayWindowEnd = dateStr ? new Date(new Date(dateStr + 'T00:00:00').getTime() + hours_(36)) : new Date(Date.now() + hours_(48));
-
-  // Filter: timed, accepted events
+  // Filter: timed, accepted events for the meeting loop
   const timedEvents = dayEvents.filter(ev => ev.start?.dateTime && isAccepted_(ev));
 
   // Classify
@@ -515,26 +818,34 @@ function processDayChain_(calId, dayEvents, isMorningSweep) {
   const existingTravelBlocks = [];
   const virtualMeetings = [];
   const userTimeBlocks = [];
+  const transitEvents = [];
   const otherEvents = [];
 
   for (const ev of timedEvents) {
     if (isTravelBlock_(ev)) existingTravelBlocks.push(ev);
+    else if (isTransitEvent_(ev)) transitEvents.push(ev);
     else if (isUserTimeBlock_(ev)) userTimeBlocks.push(ev);
+    else if (isHotelNightEvent_(ev)) { /* anchor-only via dayEvents, no travel block */ }
     else if (hasPhysicalLocation_(ev)) physicalMeetings.push(ev);
     else virtualMeetings.push(ev);
   }
 
   physicalMeetings.sort((a, b) => new Date(a.start.dateTime) - new Date(b.start.dateTime));
-  const allNonTravelEvents = [...physicalMeetings, ...virtualMeetings, ...userTimeBlocks, ...otherEvents];
+  const allNonTravelEvents = [...physicalMeetings, ...virtualMeetings, ...userTimeBlocks, ...transitEvents, ...otherEvents];
 
   logD('processDayChain_: classified', {
-    physical: physicalMeetings.length, virtual: virtualMeetings.length,
-    timeBlocks: userTimeBlocks.length, travel: existingTravelBlocks.length
+    date: dateStr,
+    physical: physicalMeetings.length,
+    virtual: virtualMeetings.length,
+    transit: transitEvents.length,
+    timeBlocks: userTimeBlocks.length,
+    travel: existingTravelBlocks.length
   });
 
   const neededTravelBlockIds = new Set();
   const conflicts = [];
 
+  // ---- MEETING LOOP ----
   for (let i = 0; i < physicalMeetings.length; i++) {
     const meeting = physicalMeetings[i];
     const meetingStart = new Date(meeting.start.dateTime);
@@ -542,8 +853,7 @@ function processDayChain_(calId, dayEvents, isMorningSweep) {
     const destination = meeting.location.trim();
 
     // ---- RESOLVE ORIGIN ----
-    // Get the anchor (home or office) for this meeting's time
-    const anchor = getAnchorForTime_(calId, meetingStart);
+    const anchor = resolveTimelineAnchor_(calId, dayEvents, meetingStart);
     let origin = anchor;
     if (i > 0) {
       const prevMeeting = physicalMeetings[i - 1];
@@ -551,10 +861,8 @@ function processDayChain_(calId, dayEvents, isMorningSweep) {
       const gap = meetingStart.getTime() - prevEnd.getTime();
 
       if (gap <= minutes_(nextMeetingWindow)) {
-        // Short gap: direct chain A→B
         origin = prevMeeting.location.trim();
       } else if (gap <= minutes_(chainWindow)) {
-        // Medium gap: check if round-trip to anchor fits
         const prevLoc = prevMeeting.location.trim();
         const returnDuration = getTravelDuration_(prevLoc, anchor, apiKey);
         const departDuration = getTravelDuration_(anchor, destination, apiKey);
@@ -574,11 +882,11 @@ function processDayChain_(calId, dayEvents, isMorningSweep) {
           origin = prevLoc;
         }
       }
-      // gap > chainWindow → origin stays as anchor
     }
 
-    // First meeting within window of day start → always home (not office — you just woke up)
-    if (i === 0) {
+    // First meeting within window of day start → home (just woke up).
+    // BUT: if hotel/transit anchor is active, keep that.
+    if (i === 0 && sameLocation_(anchor, home)) {
       const dayDate = new Date(meeting.start.dateTime);
       const dayStartTime = new Date(dayDate.getFullYear(), dayDate.getMonth(), dayDate.getDate(), dayStartHour, 0, 0);
       if (meetingStart.getTime() - dayStartTime.getTime() <= minutes_(firstMeetingWindow)) {
@@ -586,9 +894,9 @@ function processDayChain_(calId, dayEvents, isMorningSweep) {
       }
     }
 
-    // Skip if same location or destination is the current anchor
+    // Skip if same location or destination is the anchor
     if (sameLocation_(origin, destination) || sameLocation_(destination, anchor)) {
-      removeTravelBlockFor_(calId, meeting.id, dayWindowStart, dayWindowEnd);
+      removeTravelBlockFor_(calId, meeting.id, dayEvents);
       continue;
     }
 
@@ -600,13 +908,12 @@ function processDayChain_(calId, dayEvents, isMorningSweep) {
     let travelEnd = meetingStart;
     let travelStart = new Date(travelEnd.getTime() - totalMs);
 
-    // Conflict resolution
     const resolution = resolveOverlaps_(travelStart, travelEnd, allNonTravelEvents, meeting.id, calId, 0);
     travelStart = resolution.travelStart;
     travelEnd = resolution.travelEnd;
 
     neededTravelBlockIds.add(meeting.id);
-    upsertTravelBlock_(calId, meeting.id, travelStart, travelEnd, origin, destination, modeResult.mode, mapsUrl_(origin, destination, modeResult.mode), dayWindowStart, dayWindowEnd);
+    upsertTravelBlock_(calId, meeting.id, travelStart, travelEnd, origin, destination, modeResult.mode, mapsUrl_(origin, destination, modeResult.mode), dayEvents);
 
     if (!resolution.resolved && resolution.unresolvableOverlaps.length > 0) {
       conflicts.push({
@@ -624,24 +931,25 @@ function processDayChain_(calId, dayEvents, isMorningSweep) {
 
     // ---- INTRA-DAY RETURN after this meeting ----
     const nextPhysical = physicalMeetings[i + 1];
-    // Return anchor = home or office depending on Workspace working location
-    // But after evening cutoff → always home (not office)
-    const returnAnchor = (meetingEnd.getHours() >= eveningCutoff) ? home : anchor;
+    let returnAnchor;
+    if (meetingEnd.getHours() >= eveningCutoff) {
+      // Evening: prefer active hotel, else home
+      returnAnchor = getActiveHotelAt_(dayEvents, meetingEnd) || home;
+    } else {
+      returnAnchor = resolveTimelineAnchor_(calId, dayEvents, meetingEnd);
+    }
 
     if (!sameLocation_(destination, returnAnchor)) {
       let shouldCreateReturn = false;
       const returnId = meeting.id + '_return';
 
       if (!nextPhysical) {
-        // Last meeting of the day → always return
-        // After 17h → home, otherwise → anchor (home for now)
         shouldCreateReturn = true;
       } else {
         const nextStart = new Date(nextPhysical.start.dateTime);
         const gap = nextStart.getTime() - meetingEnd.getTime();
 
         if (gap > minutes_(nextMeetingWindow)) {
-          // Big enough gap — check if round-trip fits
           const returnDuration = getTravelDuration_(destination, returnAnchor, apiKey);
           const departDuration = getTravelDuration_(returnAnchor, nextPhysical.location.trim(), apiKey);
 
@@ -656,35 +964,79 @@ function processDayChain_(calId, dayEvents, isMorningSweep) {
             }
           }
         }
-        // gap <= nextMeetingWindow → no return (direct chain to next meeting)
       }
 
       if (shouldCreateReturn) {
-        // Return destination: after evening cutoff → home (or hotel if hotel night)
-        // Before evening cutoff → anchor (home or office per Workspace)
-        let returnDest = returnAnchor;
-        if (meetingEnd.getHours() >= eveningCutoff && hotelAddress) {
-          returnDest = hotelAddress;
-        }
-
-        if (!sameLocation_(destination, returnDest)) {
-          const retMode = determineTravelMode_(destination, returnDest, apiKey);
+        if (!sameLocation_(destination, returnAnchor)) {
+          const retMode = determineTravelMode_(destination, returnAnchor, apiKey);
           if (retMode) {
             const retTotalMs = retMode.durationMs + minutes_(bufferMin);
             const retStart = meetingEnd;
             const retEnd = new Date(retStart.getTime() + retTotalMs);
-            upsertTravelBlock_(calId, returnId, retStart, retEnd, destination, returnDest, retMode.mode, mapsUrl_(destination, returnDest, retMode.mode), dayWindowStart, dayWindowEnd);
+            upsertTravelBlock_(calId, returnId, retStart, retEnd, destination, returnAnchor, retMode.mode, mapsUrl_(destination, returnAnchor, retMode.mode), dayEvents);
             neededTravelBlockIds.add(returnId);
           }
         }
       } else {
-        // No return needed — clean up any existing return block
-        removeTravelBlockFor_(calId, returnId, dayWindowStart, dayWindowEnd);
+        removeTravelBlockFor_(calId, returnId, dayEvents);
       }
     }
   }
 
-  // Cleanup orphaned travel blocks
+  // ---- TRANSIT EVENT TRAVEL: arrival/departure ----
+  transitEvents.sort((a, b) => new Date(a.start.dateTime) - new Date(b.start.dateTime));
+  for (const transit of transitEvents) {
+    const transitStart = new Date(transit.start.dateTime);
+    const transitEnd = new Date(transit.end.dateTime);
+    const departureStation = (transit.location || '').trim();
+    const arrivalStation = parseTransitDestination_(transit);
+
+    // ARRIVAL TRAVEL: anchor → departure station, ending at transit start
+    if (departureStation) {
+      const arriveAnchor = resolveTimelineAnchor_(calId, dayEvents, transitStart);
+      if (!sameLocation_(arriveAnchor, departureStation)) {
+        const arriveMode = determineTravelMode_(arriveAnchor, departureStation, apiKey);
+        if (arriveMode) {
+          const platformBuffer = getTransitPlatformBuffer_(transit);
+          const totalMs = arriveMode.durationMs + minutes_(bufferMin) + minutes_(platformBuffer);
+          const blockEnd = transitStart;
+          const blockStart = new Date(blockEnd.getTime() - totalMs);
+          const arriveId = transit.id + '_arrive';
+          upsertTravelBlock_(calId, arriveId, blockStart, blockEnd, arriveAnchor, departureStation,
+            arriveMode.mode, mapsUrl_(arriveAnchor, departureStation, arriveMode.mode), dayEvents);
+          neededTravelBlockIds.add(arriveId);
+        }
+      }
+    }
+
+    // DEPARTURE TRAVEL: arrival station → home/hotel, starting at transit end.
+    // Only if NO physical meeting follows on the same day (otherwise that meeting's
+    // travel block already handles the exit via timeline anchor).
+    if (arrivalStation) {
+      const transitEndMs = transitEnd.getTime();
+      const hasFollowupMeeting = physicalMeetings.some(m =>
+        new Date(m.start.dateTime).getTime() >= transitEndMs);
+
+      if (!hasFollowupMeeting) {
+        // Future hotel after this transit takes precedence over home
+        const departTarget = getActiveHotelAfter_(dayEvents, transitEnd) || home;
+        if (!sameLocation_(arrivalStation, departTarget)) {
+          const departMode = determineTravelMode_(arrivalStation, departTarget, apiKey);
+          if (departMode) {
+            const totalMs = departMode.durationMs + minutes_(bufferMin);
+            const blockStart = transitEnd;
+            const blockEnd = new Date(blockStart.getTime() + totalMs);
+            const departId = transit.id + '_depart';
+            upsertTravelBlock_(calId, departId, blockStart, blockEnd, arrivalStation, departTarget,
+              departMode.mode, mapsUrl_(arrivalStation, departTarget, departMode.mode), dayEvents);
+            neededTravelBlockIds.add(departId);
+          }
+        }
+      }
+    }
+  }
+
+  // ---- ORPHAN CLEANUP ----
   for (const block of existingTravelBlocks) {
     const forId = block.extendedProperties?.private?.travelForEventId;
     if (forId && !neededTravelBlockIds.has(forId)) {
@@ -702,10 +1054,6 @@ function processDayChain_(calId, dayEvents, isMorningSweep) {
 
 // ===================== TRAVEL DURATION HELPER =====================
 
-/**
- * Get travel duration (ms) between two points, using the mode selection logic.
- * Convenience wrapper used for round-trip feasibility checks.
- */
 function getTravelDuration_(origin, destination, apiKey) {
   const result = determineTravelMode_(origin, destination, apiKey);
   return result ? result.durationMs : null;
@@ -828,9 +1176,12 @@ function isTravelBlock_(ev) {
 }
 
 /**
- * Create or update a travel block. Uses full-day window to find existing block (prevents duplicates).
+ * Upsert a travel block for forEventId using the in-memory dayEvents snapshot
+ * as the source of truth — no second Calendar.Events.list call. dayEvents is
+ * mutated to reflect inserts/patches/removes so subsequent iterations of the
+ * chain loop see consistent state.
  */
-function upsertTravelBlock_(calId, forEventId, start, end, origin, destination, mode, mapsUrl, dayWindowStart, dayWindowEnd) {
+function upsertTravelBlock_(calId, forEventId, start, end, origin, destination, mode, mapsUrl, dayEvents) {
   const colorId = getProp_('TRAVEL_COLOR_ID', '8');
   const modeEmoji = mode === 'bicycling' ? '🚲' : '🚇';
   const durationMin = Math.round((end.getTime() - start.getTime()) / 60000);
@@ -851,81 +1202,59 @@ function upsertTravelBlock_(calId, forEventId, start, end, origin, destination, 
     extendedProperties: { private: { travelForEventId: forEventId } }
   };
 
-  // FIX: search full day window to find existing block (prevents duplicates)
-  const existing = findTravelBlockFor_(calId, forEventId, dayWindowStart, dayWindowEnd);
+  const matches = findBlockInList_(dayEvents, forEventId);
 
-  if (existing) {
-    const needUpdate =
-      Math.abs(new Date(existing.start.dateTime) - start) > minutes_(2) ||
-      Math.abs(new Date(existing.end.dateTime) - end) > minutes_(2) ||
-      existing.summary !== summary;
-    if (needUpdate) {
-      Calendar.Events.patch(payload, calId, existing.id);
-      logI('upsertTravelBlock_: updated', { forEventId, blockId: existing.id, summary });
+  if (matches.length > 1) {
+    // Should not normally happen post-fix. Log loudly so regressions surface
+    // with the trace data we lacked in the V5.3 cascade investigation.
+    matches.sort((a, b) => new Date(a.created) - new Date(b.created));
+    logW('upsertTravelBlock_: multiple matches in dayEvents — collapsing', {
+      forEventId,
+      count: matches.length,
+      ids: matches.map(m => ({ id: m.id, created: m.created })),
+    });
+    for (let i = 1; i < matches.length; i++) {
+      try { Calendar.Events.remove(calId, matches[i].id); }
+      catch (e) { logW('upsertTravelBlock_: collapse remove failed', { id: matches[i].id, error: e.message }); }
+      consumeBlock_(dayEvents, matches[i].id);
     }
-  } else {
-    // Before creating, double-check for any other blocks with same forEventId (dedup safety net)
-    dedupTravelBlocks_(calId, forEventId, dayWindowStart, dayWindowEnd);
+  }
+
+  if (matches.length === 0) {
     const inserted = Calendar.Events.insert(payload, calId);
+    dayEvents.push(inserted);
     logI('upsertTravelBlock_: created', { forEventId, blockId: inserted.id, summary });
+    return;
+  }
+
+  const existing = matches[0];
+  const needUpdate =
+    Math.abs(new Date(existing.start.dateTime) - start) > minutes_(2) ||
+    Math.abs(new Date(existing.end.dateTime) - end) > minutes_(2) ||
+    existing.summary !== summary;
+  if (needUpdate) {
+    const patched = Calendar.Events.patch(payload, calId, existing.id);
+    Object.assign(existing, patched);
+    logI('upsertTravelBlock_: updated', { forEventId, blockId: existing.id, summary });
   }
 }
 
 /**
- * Find our travel block for a specific event ID.
- * Uses privateExtendedProperty filter for fast, server-side lookup (no client-side scan).
+ * Remove travel block(s) matching forEventId from both the calendar and the
+ * in-memory dayEvents snapshot.
  */
-function findTravelBlockFor_(calId, forEventId, windowStart, windowEnd) {
-  try {
-    const list = Calendar.Events.list(calId, {
-      timeMin: windowStart.toISOString(), timeMax: windowEnd.toISOString(),
-      singleEvents: true, maxResults: 10,
-      privateExtendedProperty: `travelForEventId=${forEventId}`
-    });
-    const items = list.items || [];
-    if (items.length > 0) return items[0];
-  } catch (e) { logW('findTravelBlockFor_: error', { error: e.message }); }
-  return null;
-}
-
-/**
- * Remove ALL travel blocks for a specific event ID (handles duplicates).
- */
-function removeTravelBlockFor_(calId, forEventId, windowStart, windowEnd) {
-  try {
-    const list = Calendar.Events.list(calId, {
-      timeMin: windowStart.toISOString(), timeMax: windowEnd.toISOString(),
-      singleEvents: true, maxResults: 50,
-      privateExtendedProperty: `travelForEventId=${forEventId}`
-    });
-    let deleted = 0;
-    for (const it of (list.items || [])) {
-      Calendar.Events.remove(calId, it.id);
+function removeTravelBlockFor_(calId, forEventId, dayEvents) {
+  const matches = findBlockInList_(dayEvents, forEventId);
+  let deleted = 0;
+  for (const m of matches) {
+    try {
+      Calendar.Events.remove(calId, m.id);
+      consumeBlock_(dayEvents, m.id);
       deleted++;
-    }
-    if (deleted > 0) logI('removeTravelBlockFor_: removed', { forEventId, count: deleted });
-    return deleted;
-  } catch (e) { logW('removeTravelBlockFor_: error', { error: e.message }); return 0; }
-}
-
-/**
- * Dedup: remove extra travel blocks for the same forEventId (keeps none — caller will create fresh).
- */
-function dedupTravelBlocks_(calId, forEventId, windowStart, windowEnd) {
-  try {
-    const list = Calendar.Events.list(calId, {
-      timeMin: windowStart.toISOString(), timeMax: windowEnd.toISOString(),
-      singleEvents: true, maxResults: 50,
-      privateExtendedProperty: `travelForEventId=${forEventId}`
-    });
-    const dupes = list.items || [];
-    if (dupes.length > 0) {
-      logW('dedupTravelBlocks_: cleaning', { forEventId, count: dupes.length });
-      for (const d of dupes) {
-        try { Calendar.Events.remove(calId, d.id); } catch (e) {}
-      }
-    }
-  } catch (e) { logW('dedupTravelBlocks_: error', { error: e.message }); }
+    } catch (e) { logW('removeTravelBlockFor_: remove failed', { id: m.id, error: e.message }); }
+  }
+  if (deleted > 0) logI('removeTravelBlockFor_: removed', { forEventId, count: deleted });
+  return deleted;
 }
 
 // ===================== CONFLICT DETECTION =====================
@@ -968,4 +1297,75 @@ function sendConflictEmail_(conflicts, date) {
     MailApp.sendEmail({ to: alertEmail, subject: `⚠️ Conflits trajet — ${dateStr}`, body });
     logI('sendConflictEmail_: sent', { conflicts: conflicts.length });
   } catch (e) { logE('sendConflictEmail_: failed', { error: e.message }); }
+}
+
+// ===================== DIAGNOSTICS =====================
+
+/**
+ * Log everything the script sees on a specific day. Edit DEBUG_DATE.
+ */
+function debugDay() {
+  const DEBUG_DATE = '2026-05-09';
+  const calId = getProp_('WATCH_CALENDAR_ID', 'primary');
+  const dayStart = new Date(DEBUG_DATE + 'T00:00:00');
+  const dayEnd = new Date(dayStart.getTime() + hours_(24));
+
+  const resp = Calendar.Events.list(calId, {
+    timeMin: dayStart.toISOString(), timeMax: dayEnd.toISOString(),
+    singleEvents: true, maxResults: 250, orderBy: 'startTime'
+  });
+  const events = resp.items || [];
+
+  console.log(`=== Events on ${DEBUG_DATE}: ${events.length} ===`);
+  for (const ev of events) {
+    const start = (ev.start?.dateTime || ev.start?.date || '?').substring(0, 16);
+    const end = (ev.end?.dateTime || ev.end?.date || '?').substring(0, 16);
+    const title = ev.summary || '(no title)';
+    const loc = ev.location || '(no location)';
+    const transit = isTransitEvent_(ev);
+    const dest = transit ? parseTransitDestination_(ev) : null;
+    const isOurBlock = isTravelBlock_(ev);
+    const isHotel = isHotelNightEvent_(ev);
+    const forId = ev.extendedProperties?.private?.travelForEventId || '(none)';
+    console.log(`  ${start} → ${end} | "${title}"`);
+    console.log(`    loc="${loc}"`);
+    console.log(`    transit=${transit}${dest ? ` (→${dest})` : ''} | hotel=${isHotel} | ourBlock=${isOurBlock} | forId=${forId}`);
+  }
+}
+
+/**
+ * Probes whether Calendar.Events.list reflects fresh inserts within seconds.
+ * Run with triggers OFF. Inserts a temporary travel-block-shaped event, polls
+ * list 5 times at 2s intervals, then removes the test event. If `found=true`
+ * appears immediately, list is strongly consistent for fresh inserts; if it
+ * lags, secondary list calls in the chain loop were exposed to that lag.
+ */
+function debugListConsistency() {
+  const calId = getProp_('WATCH_CALENDAR_ID', 'primary');
+  const testForId = 'consistency_test_' + Date.now();
+  const start = new Date(Date.now() + 10 * 60 * 1000);
+  const end = new Date(start.getTime() + 30 * 60 * 1000);
+  const dayStart = new Date(start.getFullYear(), start.getMonth(), start.getDate(), 0, 0, 0);
+  const dayEnd = new Date(dayStart.getTime() + hours_(36));
+
+  const inserted = Calendar.Events.insert({
+    summary: 'Travel test consistency',
+    start: { dateTime: start.toISOString() },
+    end:   { dateTime: end.toISOString() },
+    extendedProperties: { private: { travelForEventId: testForId } }
+  }, calId);
+  console.log(`Inserted: ${inserted.id}`);
+
+  for (let i = 0; i < 5; i++) {
+    const list = Calendar.Events.list(calId, {
+      timeMin: dayStart.toISOString(), timeMax: dayEnd.toISOString(),
+      singleEvents: true, maxResults: 250
+    });
+    const found = (list.items || []).find(ev => ev.id === inserted.id);
+    console.log(`Attempt ${i + 1} at +${i * 2}s: found=${!!found}, totalItems=${(list.items || []).length}`);
+    Utilities.sleep(2000);
+  }
+
+  Calendar.Events.remove(calId, inserted.id);
+  console.log('Test block removed.');
 }

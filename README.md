@@ -1,6 +1,6 @@
 # 🚲 Auto Commute Blocker — Google Calendar
 
-Automatically creates "Travel" blocks in Google Calendar before and after physical meetings, using real travel times (cycling or public transit) + a configurable buffer.
+Automatically creates "Travel" blocks in Google Calendar before and after physical meetings, using real travel times (cycling or public transit) + a configurable buffer. Also handles long-distance trips: train/flight events generate access blocks to the station/airport, and multi-day stays automatically anchor subsequent meetings to the hotel.
 
 Blocks show as **busy** → no one can book over your commute time.
 
@@ -16,42 +16,51 @@ Blocks show as **busy** → no one can book over your commute time.
 | `scanUpcoming_` | Every 30min (configurable) | **Next 7 days** | Safety net. Catches anything the hook missed. |
 | `morningSweep_` | Daily at 7am | **Today only** | Checks for unresolvable conflicts, sends email if needed. |
 
-### Core logic
+### Core logic — meetings
 
 For each physical meeting of the day (sorted by time):
 
-1. **Resolves origin**: where are you coming from?
-   - First meeting within 90min of day start → always from home
-   - Previous meeting < 90min before → direct A→B trip (chaining)
-   - Previous meeting 90min–2h before → checks if a round-trip home/office fits in the gap. If yes → return + depart from home/office. If no → direct A→B
-   - No meeting in the past 2h → depart from home or office (per Workspace settings)
-2. **If destination = home** → no travel block
-3. **Travel mode**: cycling if both points are within the configured city bounds and trip ≤ 45min, otherwise public transit
-4. **Google Directions API call** → real duration + buffer
-5. **Conflict resolution**: if travel overlaps a video call or "time block" → shifted before it automatically (recursive). If it overlaps a physical meeting → alert email
+1. **Resolves origin** via timeline anchor: most recent train/flight destination → active hotel → previous meeting (if chained) → home/office.
+2. **If destination = current anchor** → no travel block.
+3. **Travel mode**: cycling if both points are within the configured city bounds and trip ≤ 45min, otherwise public transit.
+4. **Google Directions API call** → real duration + buffer.
+5. **Conflict resolution**: if travel overlaps a video call or "time block" → shifted before it automatically (recursive). If it overlaps a physical meeting → alert email.
 
 ### Intra-day returns
 
 After each physical meeting, if the next physical meeting is more than 90min away:
-- Calculates whether a round-trip (meeting → home/office → next meeting) fits in the gap
-- If yes → creates a return block
-- If no → no return, the next trip will be direct A→B
+- Calculates whether a round-trip (meeting → home/office → next meeting) fits in the gap.
+- If yes → creates a return block.
+- If no → no return, the next trip will be direct A→B.
 
 ### End-of-day return
 
-- After the last physical meeting → always a return block
-- After the evening cutoff (configurable, default 5pm) → always to home (never office)
-- If a hotel night is detected → return to hotel instead
+- After the last physical meeting → return block.
+- After the evening cutoff (configurable, default 5pm) → always to home (never office).
+- If a hotel night is detected → return to hotel instead.
 
-### Office / Home (Google Workspace)
+### Train / Flight events
 
-- If you have a Workspace account with "working location" configured → the script reads whether it's an office or home day and uses the corresponding address
-- If you're on personal Gmail → always home (automatic fallback)
-- First meeting of the morning always departs from home (not office)
+Events whose title starts with a transit keyword (default: `Train`, `Flight`, `TGV`, `Vol`) followed by `to <destination>` are treated as transit, not as meetings. The script generates:
+
+- **Arrival block**: anchor → station/airport, ending at the transit start time. Per-keyword platform buffer added (10min for trains, 90min for flights).
+- **Departure block**: arrival station → home (or future hotel) at transit end — only if no follow-up physical meeting exists. Otherwise, the next meeting's own travel block handles the exit using the transit destination as anchor.
+
+After a transit event ends, its destination becomes the timeline anchor for everything that follows that day, until another transit event fires.
 
 ### Hotel nights
 
-If a calendar event starts in the evening and ends the next morning with a physical address → the script uses that address as the anchor for the last return of the evening.
+Two formats are detected as hotel anchors:
+- **Timed overnight events** — e.g. an event 10pm → 8am next day with a physical address.
+- **All-day multi-day events with a location** — e.g. Google's auto-imported "Stay at The Standard, Brussels" events.
+
+For multi-day all-day events, **the day the event starts is treated as a transit day**: hotel is *not* yet the anchor in the morning (you woke up at home). It only becomes the anchor after a transit event fires that day. From the next morning onward, the hotel is the anchor for all meetings until the stay ends.
+
+### Office / Home (Google Workspace)
+
+- If you have a Workspace account with "working location" configured → the script reads whether it's an office or home day and uses the corresponding address.
+- If you're on personal Gmail → always home (automatic fallback).
+- First meeting of the morning always departs from home (not office).
 
 ---
 
@@ -110,6 +119,7 @@ If a calendar event starts in the evening and ends the next morning with a physi
 | `ALERT_EMAIL` | `you@email.com` | **Your email** for conflict alerts |
 | `LOG_LEVEL` | `INFO` | Verbosity (`DEBUG` for troubleshooting) |
 | `TRAVEL_COLOR_ID` | `8` | Block color (8 = graphite) |
+| `TRANSIT_KEYWORDS` | `Train,Flight,TGV,Vol` | Title prefixes detected as transit (optional) |
 
 > **No personal data is in the code.** All configuration lives in Script Properties.
 
@@ -140,7 +150,10 @@ If a calendar event starts in the evening and ends the next morning with a physi
 | End-of-day return | 1 physical meeting | Return block after the meeting |
 | Video call conflict | Video call just before a distant physical meeting | Travel shifts before the video call |
 | Alert email | `sweepNow` with an unresolvable conflict | Email received |
-| Hotel night | Event 10pm→8am next day with address | Last return goes to hotel |
+| Hotel night (timed) | Event 10pm→8am next day with address | Last return goes to hotel |
+| Hotel stay (multi-day) | All-day "Stay at X" event spanning 2+ days | Hotel becomes anchor from day 2 onward |
+| Train trip | Event titled `Train to Brussels`, location = `Paris Nord` | Arrival block (home → Paris Nord, +10min platform); next-day meetings anchor from `Brussels` |
+| Flight trip | Event titled `Flight to JFK`, location = airport | Arrival block with +90min airport buffer |
 
 ---
 
@@ -152,6 +165,9 @@ If a calendar event starts in the evening and ends the next morning with a physi
 | `setup()` | Install triggers (once) |
 | `scanNow()` | Manual test — scan next 7 days |
 | `sweepNow()` | Manual test — simulate morning sweep |
+| `debugDay()` | Print everything the script sees on a specific date (edit `DEBUG_DATE`) |
+| `debugListConsistency()` | Probe Calendar.Events.list freshness — diagnostic only |
+| `emergencyCleanupTravelDuplicates()` | One-shot dedup over the next 60 days |
 
 ---
 
@@ -163,6 +179,12 @@ If a calendar event starts in the evening and ends the next morning with a physi
 - **Cycling threshold**: adjust `CYCLING_MAX_MINUTES` (default 45min)
 - **Transit only**: set `CYCLING_MAX_MINUTES` to `0`
 - **Cycling only**: set `CYCLING_MAX_MINUTES` to `999`
+
+### Adapt the transit keywords
+
+- Default keywords: `Train`, `Flight`, `TGV`, `Vol` (English + French)
+- Override via `TRANSIT_KEYWORDS` script property (comma-separated)
+- Per-keyword platform buffer is hardcoded in `TRANSIT_PLATFORM_BUFFERS` (Train/TGV: 10min, Flight/Vol: 90min)
 
 ### Google Calendar colors
 
@@ -208,12 +230,14 @@ Description includes: origin → destination, mode, clickable Google Maps itiner
 | Problem | Solution |
 |---|---|
 | `onEventUpdated` fails on setup | Re-run `setup()` 2-3 times. Intermittent Google issue. 30-min polling works as fallback. |
-| Duplicate travel blocks | Fixed with `LockService` + `privateExtendedProperty` filter. Run `scanNow()` to clean up. |
+| Duplicate travel blocks | Should not happen — dedup uses the in-memory day snapshot, not a second list call. If it does, the executions log will show a `multiple matches in dayEvents — collapsing` WARN with full trace. Run `emergencyCleanupTravelDuplicates()` to clear any backlog. |
 | No block created | Check: physical address in location field, meeting accepted, destination ≠ home. Set `LOG_LEVEL` to `DEBUG`. |
 | No blocks on first run | Normal: sync token initializes on first run. Blocks appear from 2nd change. Run `scanNow()` to force. |
 | Wrong transport mode | Cycling only if both points are in the bounding box AND ≤ 45min. |
 | Working location ignored | Requires Google Workspace. Personal Gmail → always home. |
 | Sync slower on mobile | Normal: Google Calendar on mobile syncs less frequently than desktop. |
+| Hotel anchor used on day of arrival | Expected: on the day a multi-day stay starts, you're treated as still at home. The hotel becomes anchor only after a transit event fires (or from day 2 of the stay). |
+| Train event treated as a meeting | Title must start with a transit keyword followed by ` to ` (e.g. `Train to Brussels`). Otherwise it's classified as a regular meeting. |
 
 ---
 
