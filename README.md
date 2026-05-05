@@ -165,9 +165,43 @@ For multi-day all-day events, **the day the event starts is treated as a transit
 | `setup()` | Install triggers (once) |
 | `scanNow()` | Manual test — scan next 7 days |
 | `sweepNow()` | Manual test — simulate morning sweep |
-| `debugDay()` | Print everything the script sees on a specific date (edit `DEBUG_DATE`) |
-| `debugListConsistency()` | Probe Calendar.Events.list freshness — diagnostic only |
-| `emergencyCleanupTravelDuplicates()` | One-shot dedup over the next 60 days |
+
+---
+
+## Debugging
+
+The Apps Script editor's **Executions** panel (clock icon → "Executions") is the primary debugging surface. Set `LOG_LEVEL` to `DEBUG` to see classification details and anchor resolution; `INFO` is enough for day-to-day monitoring.
+
+### Diagnostic functions
+
+| Function | What it does | When to use |
+|---|---|---|
+| `debugDay()` | Prints every event the script sees on `DEBUG_DATE` (edit the constant inside the function) — title, location, classification (transit/hotel/our-block), `travelForEventId`. | When something looks wrong on a specific day and you want to see the script's view of that day's calendar. |
+| `debugListConsistency()` | Inserts a temporary travel-block-shaped event, polls `Calendar.Events.list` 5 times at 2s intervals, then deletes it. Reports `found=true/false` per attempt. | Sanity check that Calendar.Events.list reflects fresh inserts. Run with triggers OFF. |
+| `emergencyCleanupTravelDuplicates()` | One-shot dedup over the next 60 days: groups blocks by `travelForEventId`, keeps the earliest-created in each group, deletes the rest. | When you spot duplicates in the calendar and want to clear the backlog. |
+
+### If duplicates ever come back
+
+Open Executions and search for the line:
+
+```
+upsertTravelBlock_: multiple matches in dayEvents — collapsing
+```
+
+If it appears, the WARN entry dumps the full `forEventId`, the list of duplicate block ids, and their `created` timestamps. That's the trace data you'd send to a debugging session — it tells you exactly what was already on the calendar at the moment the script tried to upsert. Without that line, the path that historically caused the cascade is no longer reachable.
+
+If the line *is* present, also run `debugListConsistency()` and `debugDay()` for the affected date and capture the output before re-disabling triggers.
+
+### Verifying a fresh setup
+
+After running `setup()` for the first time:
+
+1. Run `scanNow()`. Wait for "scanDays_: done" in the log.
+2. Check the calendar visually: one travel block per upcoming physical meeting, none duplicated.
+3. Wait 5 minutes idle. Run `debugDay()` for tomorrow's date. Block count should not have grown.
+4. Create a test event with a physical address ~30 min out. Wait up to 30s for `onEventUpdated` to fire. One block should appear.
+5. Edit the test event's start time. Confirm the existing block is **patched** (same id, new times) — not duplicated. This is the path that historically caused the cascade.
+6. Delete the test event. Confirm the block is removed by orphan cleanup on the next chain pass.
 
 ---
 
